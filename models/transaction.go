@@ -11,5 +11,14 @@ type Transaction struct {
     Status      string    `db:"status" json:"status"`
     Amount      int64     `db:"amount" json:"amount"`
     ReferenceID string    `db:"reference_id" json:"reference_id"`
-    CreatedAt   time.Time `db:"created_at" json:"created_at"`
+    TransactedAt   time.Time `db:"created_at" json:"transacted_at"`
+}
+
+type TransactionDTO struct {
+	ID          string    `json:"id"`
+	Status      string    `json:"status"`
+	TransactedAt time.Time `json:"transacted_at"`
+	Type        string    `json:"type"`
+	Amount      int64     `json:"amount"`
+	ReferenceID string    `json:"reference_id"`
 }

@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"net/http"
 	"time"
 
@@ -8,6 +9,7 @@ import (
 	"mini-wallet/repositories"
 
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
 )
 
@@ -15,13 +17,15 @@ type WalletHandler struct {
 	walletRepo        repositories.WalletRepository
 	transactionRepo   repositories.TransactionRepository
 	customerTokenRepo repositories.CustomerTokenRepository
+	redisClient       *redis.Client
 }
 
-func NewWalletHandler(walletRepo repositories.WalletRepository, transactionRepo repositories.TransactionRepository, customerTokenRepo repositories.CustomerTokenRepository) *WalletHandler {
+func NewWalletHandler(walletRepo repositories.WalletRepository, transactionRepo repositories.TransactionRepository, customerTokenRepo repositories.CustomerTokenRepository, redisClient *redis.Client) *WalletHandler {
 	return &WalletHandler{
 		walletRepo:        walletRepo,
 		transactionRepo:   transactionRepo,
 		customerTokenRepo: customerTokenRepo,
+		redisClient:       redisClient,
 	}
 }
 
@@ -98,7 +102,7 @@ func (h *WalletHandler) EnableWallet(c *gin.Context) {
 	// Return response
 	c.JSON(http.StatusCreated, gin.H{
 		"status": "success",
- 			"data": gin.H{
+		"data": gin.H{
 			"wallet": gin.H{
 				"id":         wallet.ID,
 				"owned_by":   wallet.OwnedBy,
@@ -106,6 +110,162 @@ func (h *WalletHandler) EnableWallet(c *gin.Context) {
 				"enabled_at": wallet.EnabledAt,
 				"balance":    wallet.Balance,
 			},
+		},
+	})
+
+}
+
+func (h *WalletHandler) ViewWalletBalance(c *gin.Context) {
+	ctx := context.Background()
+
+	// Get Authorization token from header
+	token := c.GetHeader("Authorization")
+	if token == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"status": "fail",
+			"data": gin.H{
+				"error": "Authorization token is required",
+			},
+		})
+		return
+	}
+	token = token[6:]
+
+	// Get customerXID by token
+	customerXID, err := h.customerTokenRepo.GetCustomerXIDByToken(token)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"status": "fail",
+			"data": gin.H{
+				"error": "Invalid token",
+			},
+		})
+		return
+	}
+
+	wallet, err := h.walletRepo.GetWalletByCustomerXID(customerXID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"status": "fail",
+			"data": gin.H{
+				"error": "Wallet not found",
+			},
+		})
+		return
+	}
+
+	// wallet is disabled
+	if wallet.Status == "disabled" {
+		c.JSON(http.StatusNotFound, gin.H{
+			"status": "fail",
+			"data": gin.H{
+				"error": "Wallet disabled",
+			},
+		})
+		return
+	}
+
+	// Try to get balance from redis first
+	cacheKey := "wallet_balance:" + customerXID
+	cachedBalance, err := h.redisClient.Get(ctx, cacheKey).Result()
+	if err == nil {
+		// Cache hit
+		c.JSON(http.StatusOK, gin.H{
+			"status": "success",
+			"data":   gin.H{"wallet": gin.H{"balance": cachedBalance}},
+		})
+		return
+	}
+
+	// Cache miss, fetch from db
+	c.JSON(http.StatusOK, gin.H{
+		"status": "success",
+		"data": gin.H{
+			"wallet": gin.H{
+				"id":         wallet.ID,
+				"owned_by":   wallet.OwnedBy,
+				"status":     wallet.Status,
+				"enabled_at": wallet.EnabledAt,
+				"balance":    wallet.Balance,
+			},
+		},
+	})
+}
+
+func (h *WalletHandler) ViewWalletTransactions(c *gin.Context) {
+	// Get Authorization token from header
+	token := c.GetHeader("Authorization")
+	if token == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"status": "fail",
+			"data": gin.H{
+				"error": "Authorization token is required",
+			},
+		})
+		return
+	}
+	token = token[6:]
+
+	// Get customerXID by token
+	customerXID, err := h.customerTokenRepo.GetCustomerXIDByToken(token)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{
+			"status": "fail",
+			"data": gin.H{
+				"error": "Invalid token",
+			},
+		})
+		return
+	}
+
+	wallet, err := h.walletRepo.GetWalletByCustomerXID(customerXID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"status": "fail",
+			"data": gin.H{
+				"error": "Wallet not found",
+			},
+		})
+		return
+	}
+
+	// wallet is disabled
+	if wallet.Status == "disabled" {
+		c.JSON(http.StatusNotFound, gin.H{
+			"status": "fail",
+			"data": gin.H{
+				"error": "Wallet disabled",
+			},
+		})
+		return
+	}
+
+	// Get list transaction from the wallet
+	transactions, err := h.transactionRepo.GetTransactionsByWalletID(wallet.ID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{
+			"status":  "error",
+			"message": "Failed to retrieve transactions",
+		})
+		return
+	}
+
+	var transactionsDTO []models.TransactionDTO
+	for _, transaction := range transactions {
+		transactionsDTO = append(transactionsDTO, models.TransactionDTO{
+			ID:           transaction.ID,
+			Status:       transaction.Status,
+			TransactedAt: transaction.TransactedAt,
+			Type:         transaction.Type,
+			Amount:       transaction.Amount,
+			ReferenceID:  transaction.ReferenceID,
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "success",
+		"data": gin.H{
+			"transactions": transactionsDTO,
 		},
 	})
 
@@ -141,13 +301,13 @@ func (h *WalletHandler) Deposit(c *gin.Context) {
 
 	// Create the transaction
 	transaction := models.Transaction{
-		ID:          uuid.New().String(),
-		WalletID:    "wallet-id",
-		Type:        "deposiot",
-		Status:      "success",
-		Amount:      request.Amount,
-		ReferenceID: request.ReferenceID,
-		CreatedAt:   time.Now().UTC(),
+		ID:           uuid.New().String(),
+		WalletID:     "wallet-id",
+		Type:         "deposiot",
+		Status:       "success",
+		Amount:       request.Amount,
+		ReferenceID:  request.ReferenceID,
+		TransactedAt: time.Now().UTC(),
 	}
 
 	if err := h.transactionRepo.CreateTransaction(&transaction); err != nil {
@@ -195,13 +355,13 @@ func (h *WalletHandler) Withdraw(c *gin.Context) {
 
 	// Create the transaction
 	transaction := models.Transaction{
-		ID:          uuid.New().String(),
-		WalletID:    "wallet-id",
-		Type:        "withdraw",
-		Status:      "success",
-		Amount:      request.Amount,
-		ReferenceID: request.ReferenceID,
-		CreatedAt:   time.Now().UTC(),
+		ID:           uuid.New().String(),
+		WalletID:     "wallet-id",
+		Type:         "withdraw",
+		Status:       "success",
+		Amount:       request.Amount,
+		ReferenceID:  request.ReferenceID,
+		TransactedAt: time.Now().UTC(),
 	}
 
 	if err := h.transactionRepo.CreateTransaction(&transaction); err != nil {
