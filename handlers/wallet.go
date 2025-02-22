@@ -3,7 +3,9 @@ package handlers
 import (
 	"context"
 	"log"
+	"math/rand"
 	"net/http"
+	"strconv"
 	"time"
 
 	"mini-wallet/models"
@@ -166,19 +168,28 @@ func (h *WalletHandler) ViewWalletBalance(c *gin.Context) {
 		return
 	}
 
-	// Try to get balance from redis first
-	cacheKey := "wallet_balance:" + customerXID
-	cachedBalance, err := h.redisClient.Get(ctx, cacheKey).Result()
-	if err == nil {
-		// Cache hit
-		c.JSON(http.StatusOK, gin.H{
-			"status": "success",
-			"data":   gin.H{"wallet": gin.H{"balance": cachedBalance}},
-		})
+	// Calculate balance from transactions for consistency
+	transactions, err := h.transactionRepo.GetTransactionsByWalletID(wallet.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "Failed to fetch transactions"})
 		return
 	}
+	var balance int64
+	for _, t := range transactions {
+		if t.Type == "deposit" {
+			balance += t.Amount
+		} else if t.Type == "withdrawal" {
+			balance -= t.Amount
+		}
+	}
 
-	// Cache miss, fetch from db
+	// Update Redis cache
+	cacheKey := "wallet_balance:" + customerXID
+	if err := h.redisClient.Set(ctx, cacheKey, wallet.Balance, 15*time.Second).Err(); err != nil {
+		log.Println("Failed to update Redis cache:", err)
+	}
+
+	// Fetch from db
 	c.JSON(http.StatusOK, gin.H{
 		"status": "success",
 		"data": gin.H{
@@ -244,7 +255,7 @@ func (h *WalletHandler) ViewWalletTransactions(c *gin.Context) {
 	// Get list transaction from the wallet
 	transactions, err := h.transactionRepo.GetTransactionsByWalletID(wallet.ID)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{
+		c.JSON(http.StatusInternalServerError, gin.H{
 			"status":  "error",
 			"message": "Failed to retrieve transactions",
 		})
@@ -288,33 +299,6 @@ func (h *WalletHandler) Deposit(c *gin.Context) {
 	}
 	token = token[6:]
 
-	var request struct {
-		Amount      int64  `json:"amount"`
-		ReferenceID string `json:"reference_id"`
-	}
-
-	if err := c.ShouldBindJSON(&request); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"status": "fail",
-			"data": gin.H{
-				"error": err.Error(),
-			},
-		})
-		return
-	}
-
-	// Check if the referenceId already exists
-	_, err := h.transactionRepo.GetTransactionByReferenceID(request.ReferenceID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"status": "fail",
-			"data": gin.H{
-				"reference_id": "duplicate reference_id",
-			},
-		})
-		return
-	}
-
 	// Get customerXID by token
 	customerXID, err := h.customerTokenRepo.GetCustomerXIDByToken(token)
 	if err != nil {
@@ -349,22 +333,32 @@ func (h *WalletHandler) Deposit(c *gin.Context) {
 		return
 	}
 
-	// Update balance in Redis Immidiately
-	cacheKey := "wallet_balance:" + customerXID
-	newBalance := wallet.Balance + request.Amount
-	err = h.redisClient.Set(ctx, cacheKey, newBalance, 10*time.Second).Err()
-	if err != nil {
-		log.Println("Failed to update Redis balance:", err)
+	// parse form data
+	amountStr := c.PostForm("amount")
+	referenceID := c.PostForm("reference_id")
+
+	if amountStr == "" || referenceID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "fail", "data": gin.H{"error": "amount and reference_id are required"}})
+		return
 	}
 
-	// Schedule DB after max 5 seconds
-	go func() {
-		time.Sleep(5 * time.Second)
-		err := h.walletRepo.UpdateWalletBalance(wallet.ID, newBalance)
-		if err != nil {
-			log.Println("Failed to update DB balance:", err)
-		}
-	}()
+	// Convert amount to int64
+	amount, err := strconv.ParseInt(amountStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "fail", "data": gin.H{"error": "invalid amount format"}})
+		return
+	}
+
+	// Check if the referenceId already exists
+	if _, err := h.transactionRepo.GetTransactionByReferenceID(referenceID); err == nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"status": "fail",
+			"data": gin.H{
+				"reference_id": "duplicate reference_id",
+			},
+		})
+		return
+	}
 
 	// Create the transaction
 	transaction := models.Transaction{
@@ -372,18 +366,60 @@ func (h *WalletHandler) Deposit(c *gin.Context) {
 		WalletID:     wallet.ID,
 		Type:         "deposit",
 		Status:       "success",
-		Amount:       request.Amount,
-		ReferenceID:  request.ReferenceID,
+		Amount:       amount,
+		ReferenceID:  referenceID,
 		TransactedAt: time.Now().UTC(),
 	}
 
-	if err := h.transactionRepo.CreateTransaction(&transaction); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"status":  "error",
-			"message": err.Error(),
-		})
+	// Record the transaction
+	err = h.transactionRepo.CreateTransaction(&transaction)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "Failed to record transaction"})
 		return
 	}
+
+	// Defer balance update with random delay up to 5 seconds
+	go func(walletID string, customerXID string) {
+		delay := time.Duration(rand.Intn(5)) * time.Second
+		time.Sleep(delay)
+
+		// Acquire lock to ensure atomic balance update
+		lockKey := "lock:wallet:" + customerXID
+		lock := h.redisClient.SetNX(ctx, lockKey, "1", 15*time.Second)
+		if err := lock.Err(); err != nil || !lock.Val() {
+			log.Printf("Failed to acquire lock for balance update of wallet %s", walletID)
+			return
+		}
+		defer h.redisClient.Del(ctx, lockKey)
+
+		// Calculate balance from transactions
+		transactions, err := h.transactionRepo.GetTransactionsByWalletID(walletID)
+		if err != nil {
+			log.Printf("Failed to fetch transactions for wallet %s: %v", walletID, err)
+			return
+		}
+		var newBalance int64
+		for _, t := range transactions {
+			if t.Type == "deposit" {
+				newBalance += t.Amount
+			} else if t.Type == "withdrawal" {
+				newBalance -= t.Amount
+			}
+		}
+
+		// Update database balance
+		if err := h.walletRepo.UpdateWalletBalance(walletID, newBalance); err != nil {
+			log.Printf("Failed to update database balance for wallet %s: %v", walletID, err)
+			return
+		}
+
+		// Update redis balance
+		cacheKey := "wallet_balance:" + customerXID
+		if err := h.redisClient.Set(ctx, cacheKey, newBalance, 15*time.Second).Err(); err != nil {
+			log.Printf("Failed to update Redis balance for %s: %v", cacheKey, err)
+			h.redisClient.Del(ctx, cacheKey)
+		}
+	}(wallet.ID, customerXID)
 
 	c.JSON(http.StatusCreated, gin.H{
 		"status": "success",
@@ -416,29 +452,11 @@ func (h *WalletHandler) Withdraw(c *gin.Context) {
 	}
 	token = token[6:]
 
-	var request struct {
-		Amount      int64  `json:"amount"`
-		ReferenceID string `json:"reference_id"`
-	}
-	if err := c.ShouldBindJSON(&request); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"status": "fail",
-			"data": gin.H{
-				"error": err.Error(),
-			},
-		})
-		return
-	}
-
-	// Check if the referenceId already exists
-	_, err := h.transactionRepo.GetTransactionByReferenceID(request.ReferenceID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"status": "fail",
-			"data": gin.H{
-				"reference_id": "duplicate reference_id",
-			},
-		})
+	// Parse form data
+	amountStr := c.PostForm("amount")
+	referenceID := c.PostForm("reference_id")
+	if amountStr == "" || referenceID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "fail", "data": gin.H{"error": "amount and reference_id are required"}})
 		return
 	}
 
@@ -476,28 +494,29 @@ func (h *WalletHandler) Withdraw(c *gin.Context) {
 		return
 	}
 
-	// Ensure sufficient balance
-	if wallet.Balance < request.Amount {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "fail", "data": gin.H{"error": "Insufficient balance"}})
+	// convert amount to int64
+	amount, err := strconv.ParseInt(amountStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "fail", "data": gin.H{"error": "invalid amount format"}})
 		return
 	}
 
-	// Update data in redis immidiately
-	cacheKey := "wallet_balance:" + customerXID
-	newBalance := wallet.Balance - request.Amount
-	err = h.redisClient.Set(ctx, cacheKey, newBalance, 10*time.Second).Err()
-	if err != nil {
-		log.Println("Failed to update Redis balance:", err)
+	// Check if the referenceId already exists
+	if _, err := h.transactionRepo.GetTransactionByReferenceID(referenceID); err == nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"status": "fail",
+			"data": gin.H{
+				"reference_id": "duplicate reference_id",
+			},
+		})
+		return
 	}
 
-	// Schedule db update after max 5 seconds
-	go func() {
-		time.Sleep(5 * time.Second)
-		err := h.walletRepo.UpdateWalletBalance(wallet.ID, newBalance)
-		if err != nil {
-			log.Println("Failed to update DB balance:", err)
-		}
-	}()
+	// Ensure sufficient balance
+	if wallet.Balance < amount {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "fail", "data": gin.H{"error": "Insufficient balance"}})
+		return
+	}
 
 	// Create the transaction
 	transaction := models.Transaction{
@@ -505,18 +524,60 @@ func (h *WalletHandler) Withdraw(c *gin.Context) {
 		WalletID:     wallet.ID,
 		Type:         "withdrawal",
 		Status:       "success",
-		Amount:       request.Amount,
-		ReferenceID:  request.ReferenceID,
+		Amount:       amount,
+		ReferenceID:  referenceID,
 		TransactedAt: time.Now().UTC(),
 	}
 
-	if err := h.transactionRepo.CreateTransaction(&transaction); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"status":  "error",
-			"message": err.Error(),
-		})
+	// Record the transaction
+	err = h.transactionRepo.CreateTransaction(&transaction)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "Failed to record transaction"})
 		return
 	}
+
+	// Defer balance update with a random delay up to 5 seconds
+	go func(walletID string, customerXID string) {
+		delay := time.Duration(rand.Intn(5)) * time.Second // Random delay between 0-5 seconds
+		time.Sleep(delay)
+
+		// Acquire lock to ensure atomic balance update
+		lockKey := "lock:wallet:" + customerXID
+		lock := h.redisClient.SetNX(ctx, lockKey, "1", 15*time.Second)
+		if err := lock.Err(); err != nil || !lock.Val() {
+			log.Printf("Failed to acquire lock for balance update of wallet %s", walletID)
+			return
+		}
+		defer h.redisClient.Del(ctx, lockKey)
+
+		// Calculate balance from transactions
+		transactions, err := h.transactionRepo.GetTransactionsByWalletID(walletID)
+		if err != nil {
+			log.Printf("Failed to fetch transactions for wallet %s: %v", walletID, err)
+			return
+		}
+		var newBalance int64
+		for _, t := range transactions {
+			if t.Type == "deposit" {
+				newBalance += t.Amount
+			} else if t.Type == "withdrawal" {
+				newBalance -= t.Amount
+			}
+		}
+
+		// Update database balance
+		if err := h.walletRepo.UpdateWalletBalance(walletID, newBalance); err != nil {
+			log.Printf("Failed to update database balance for wallet %s: %v", walletID, err)
+			return
+		}
+
+		// Update Redis balance
+		cacheKey := "wallet_balance:" + customerXID
+		if err := h.redisClient.Set(ctx, cacheKey, newBalance, 15*time.Second).Err(); err != nil {
+			log.Printf("Failed to update Redis balance for %s: %v", cacheKey, err)
+			h.redisClient.Del(ctx, cacheKey)
+		}
+	}(wallet.ID, customerXID)
 
 	c.JSON(http.StatusCreated, gin.H{
 		"status": "success",
@@ -593,7 +654,8 @@ func (h *WalletHandler) DisableWallet(c *gin.Context) {
 	}
 
 	// Disable wallet
-	if err := h.walletRepo.UpdateWalletStatus(wallet.ID, "disabled", wallet.EnabledAt); err != nil {
+	disabledAt := time.Now().UTC()
+	if err := h.walletRepo.UpdateWalletStatus(wallet.ID, "disabled", disabledAt); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"status":  "error",
 			"message": "Failed to disable wallet",
@@ -601,19 +663,19 @@ func (h *WalletHandler) DisableWallet(c *gin.Context) {
 		return
 	}
 
-	// Fetch updated wallet details
-	updatedWallet, _ := h.walletRepo.GetWalletByCustomerXID(customerXID)
+	wallet.Status = "disabled"
+	wallet.DisabledAt = disabledAt
 
 	// Respond with success
 	c.JSON(http.StatusOK, gin.H{
 		"status": "success",
 		"data": gin.H{
 			"wallet": gin.H{
-				"id":          updatedWallet.ID,
+				"id":          wallet.ID,
 				"owned_by":    customerXID,
-				"status":      updatedWallet.Status,
-				"disabled_at": updatedWallet.DisabledAt.Format(time.RFC3339),
-				"balance":     updatedWallet.Balance,
+				"status":      wallet.Status,
+				"disabled_at": wallet.DisabledAt.Format(time.RFC3339),
+				"balance":     wallet.Balance,
 			},
 		},
 	})

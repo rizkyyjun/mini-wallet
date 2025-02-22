@@ -29,7 +29,7 @@ func (r *walletRepository) GetWalletByCustomerXID(customerXID string) (*models.W
 
 func (r *walletRepository) CreateWallet(wallet *models.Wallet) error {
 	query := `INSERT INTO wallets (id, owned_by, status, enabled_at, disabled_at, balance)
-				VALUES ($1, $2, $3, $4, $5, $6)`
+			  VALUES ($1, $2, $3, $4, $5, $6)`
 	_, err := r.db.Exec(query, wallet.ID, wallet.OwnedBy, wallet.Status, wallet.EnabledAt, wallet.DisabledAt, wallet.Balance)
 	return err
 }
@@ -64,4 +64,29 @@ func (r *walletRepository) UpdateWalletBalance(walletID string, newBalance int64
 	WHERE id = $2`
 	_, err := r.db.Exec(query, newBalance, walletID)
 	return err
+}
+
+func (r *walletRepository) UpdateWalletBalanceWithTx(tx *sql.Tx, walletID string, balance int64) error {
+    query := `UPDATE wallets SET balance = $1 WHERE id = $2`
+    _, err := tx.Exec(query, balance, walletID)
+    return err
+}
+
+func (r *walletRepository) WithTransaction(fn func(tx *sql.Tx) error) error {
+    tx, err := r.db.Begin()
+    if err != nil {
+        return err
+    }
+
+    // Execute the provided function within the transaction
+    if err := fn(tx); err != nil {
+        // Rollback on error
+        if rollbackErr := tx.Rollback(); rollbackErr != nil {
+            return rollbackErr
+        }
+        return err
+    }
+
+    // Commit the transaction if no errors
+    return tx.Commit()
 }

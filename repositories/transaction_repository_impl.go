@@ -41,11 +41,19 @@ func (r *transactionRepository) GetTransactionsByWalletID(walletID string) ([]mo
 
 	for rows.Next() {
 		var transaction models.Transaction
-		err := rows.Scan(&transaction.ID, &transaction.WalletID, &transaction.Type, &transaction.Status, &transaction.Amount, &transaction.ReferenceID, &transaction, transaction.TransactedAt)
+		err := rows.Scan(&transaction.ID, &transaction.WalletID, &transaction.Type, &transaction.Status, &transaction.Amount, &transaction.ReferenceID, &transaction.TransactedAt)
 		if err != nil {
 			return nil, err
 		}
 		transactions = append(transactions, transaction)
 	}
 	return transactions, nil
+}
+
+func (r *transactionRepository) CreateTransactionWithTx(tx *sql.Tx, transaction *models.Transaction) error {
+	query := `INSERT INTO transactions (id, wallet_id, status, transacted_at, type, amount, reference_id)
+              VALUES ($1, $2, $3, $4, $5, $6, $7)`
+	_, err := tx.Exec(query, transaction.ID, transaction.WalletID, transaction.Status, transaction.TransactedAt,
+		transaction.Type, transaction.Amount, transaction.ReferenceID)
+	return err
 }
