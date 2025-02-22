@@ -1,0 +1,54 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Logs
+*.log
+
+# Compiled object files
+*.o
+*.a
+*.lo
+*.la
+*.lai
+*.rej
+
+# Go vendor directory (if using `dep` or `go mod vendor`)
+/vendor/
+
+# Go workspace file
+go.work
+
+# Go build and cache directories
+/bin/
+/pkg/
+/build/
+
+# Environment variables and secrets
+.env
+.env.local
+.env.*.local
+config.yaml
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Dependency files
+go.sum
+
+# PostgreSQL data and dumps
+*.sql
+*.dump
+pgdata/
+
+# Docker and Kubernetes
+.dockerignore
+docker-compose.override.yml
