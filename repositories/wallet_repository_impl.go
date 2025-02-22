@@ -57,8 +57,11 @@ func (r *walletRepository) UpdateWallet(wallet *models.Wallet) error {
 	return err
 }
 
-func (r *walletRepository) DisableWallet(wallet *models.Wallet) error {
-	wallet.Status = "disabled"
-	wallet.DisabledAt = time.Now().UTC()
-	return r.UpdateWallet(wallet)
+func (r *walletRepository) UpdateWalletBalance(walletID string, newBalance int64) error {
+	query := `
+	UPDATE wallets
+	SET balance = $1
+	WHERE id = $2`
+	_, err := r.db.Exec(query, newBalance, walletID)
+	return err
 }

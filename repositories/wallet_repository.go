@@ -11,5 +11,5 @@ type WalletRepository interface {
 	GetWalletByID(id string) (*models.Wallet, error)
 	UpdateWallet(wallet *models.Wallet) error
 	UpdateWalletStatus(walletID string, status string, enabledAt time.Time) error
-	DisableWallet(wallet *models.Wallet) error
+	UpdateWalletBalance(walletID string, newBalance int64) error
 }
