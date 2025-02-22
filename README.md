@@ -1,4 +1,4 @@
-# Mini Wallet Exercise
+# Mini Wallet Project
 
 This is a Mini Wallet implementation in Go using PostgreSQL and Redis. The project provides wallet functionalities such as balance retrieval, deposit, withdrawal, and transaction history.
 
