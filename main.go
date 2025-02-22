@@ -80,7 +80,7 @@ func main() {
 	router.POST("/api/v1/init", initHandler.Init)
 	router.POST("/api/v1/wallet", walletHandler.EnableWallet)
 	router.GET("/api/v1/wallet", walletHandler.ViewWalletBalance)
-	router.GET("/api/v1/wallet/transacions", walletHandler.ViewWalletTransactions)
+	router.GET("/api/v1/wallet/transactions", walletHandler.ViewWalletTransactions)
 	router.POST("/api/v1/wallet/deposits", walletHandler.Deposit)
 	router.POST("/api/v1/wallet/withdrawals", walletHandler.Withdraw)
 	router.PATCH("/api/v1/wallet", walletHandler.DisableWallet)
